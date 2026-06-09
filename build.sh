@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Script de Build para a Nuvem (Render)
-# 1. Instala as bibliotecas de Python
+# Sair imediatamente se algum comando falhar
+set -o errexit
+
+# Instalar bibliotecas Python
 pip install -r requirements.txt
 
-# 2. Instala o navegador Chromium invisível exigido pelo Playwright
+# Baixar apenas o Chromium, sem pedir root/sudo
+export PLAYWRIGHT_BROWSERS_PATH=0
 playwright install chromium
-playwright install-deps chromium
