@@ -186,10 +186,11 @@ async def extrair_jogos_flashscore(data: datetime = None):
         # OTIMIZAÇÃO EXTREMA: Bloqueia carregamento de imagens, vídeos, fontes e estilos CSS
         await context.route("**/*", interceptar_rota)
         
-        page = await context.new_page()
         for esporte, url in URLS_ESPORTES.items():
+            page = await context.new_page()
             texto = await extrair_texto_esporte(page, esporte, url, data)
             if texto: dados_por_esporte[esporte] = texto
+            await page.close() # Libera a RAM do Linux fechando a aba
         await browser.close()
     return dados_por_esporte
 
@@ -379,11 +380,15 @@ def gerar_excel(jogos, heatmap, power_hours, alertas, data: datetime = None):
 # =============================================
 # SERVIDOR CLOUD API (FASTAPI)
 # =============================================
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+import uuid
 
 app = FastAPI(title="Motor Kairós SaaS API")
+
+# Dicionário em memória para gerenciar o Polling (Tickets)
+tarefas_varredura = {}
 
 # Libera o bloqueio de CORS para o site da Vercel
 app.add_middleware(
@@ -398,16 +403,49 @@ app.add_middleware(
 def health_check():
     return {"status": "online", "mensagem": "Motor Kairós operando na Nuvem ☁️"}
 
+async def processar_varredura_background(task_id: str, dt: datetime, data_cmd: str):
+    try:
+        tarefas_varredura[task_id] = {"status": "processando", "mensagem": "Raspando os esportes..."}
+        dados_brutos = await extrair_jogos_flashscore(dt)
+        if not dados_brutos:
+            tarefas_varredura[task_id] = {"status": "erro", "mensagem": "Nenhum dado encontrado no Flashscore."}
+            return
+
+        jogos = extrair_todos_jogos_com_ia(dados_brutos)
+        if not jogos:
+            tarefas_varredura[task_id] = {"status": "erro", "mensagem": "Nenhum jogo estruturado extraído."}
+            return
+
+        heatmap = calcular_heatmap(jogos)
+        power_hours = calcular_power_hours(heatmap)
+        alertas = calcular_alertas(jogos, power_hours)
+        
+        arquivo_excel = gerar_excel(jogos, heatmap, power_hours, alertas, dt)
+        
+        with open(arquivo_excel, "rb") as f:
+            bytes_planilha = f.read()
+        planilha_base64 = base64.b64encode(bytes_planilha).decode('utf-8')
+        os.remove(arquivo_excel)
+        
+        tarefas_varredura[task_id] = {
+            "status": "concluido",
+            "dados_painel": {"total_jogos": len(jogos)},
+            "planilha_nome": arquivo_excel,
+            "planilha_base64": planilha_base64
+        }
+        print(f"✅ Tarefa {task_id} concluída com sucesso!")
+    except Exception as e:
+        print(f"❌ Erro na tarefa {task_id}: {e}")
+        tarefas_varredura[task_id] = {"status": "erro", "mensagem": str(e)}
+
 @app.get("/analisar")
-async def endpoint_analisar(data: str = Query("hoje"), token: str = Query("")):
+async def endpoint_analisar(background_tasks: BackgroundTasks, data: str = Query("hoje"), token: str = Query("")):
     print(f"📡 Requisição recebida. Data: {data}")
     
-    # 1. A FECHADURA (VERIFICAÇÃO DE SEGURANÇA)
     if not verificar_token_seguranca(token):
         print("❌ Bloqueio: Licença inválida.")
         raise HTTPException(status_code=401, detail="Assinatura Kairós inativa ou inválida. Renove seu acesso.")
     
-    # 2. INÍCIO DA RASPAGEM
     data_cmd = data.lower().strip()
     if data_cmd == "hoje": dt = datetime.now()
     elif data_cmd in ["amanha", "amanhã"]: dt = datetime.now() + timedelta(days=1)
@@ -415,34 +453,21 @@ async def endpoint_analisar(data: str = Query("hoje"), token: str = Query("")):
         try: dt = datetime.strptime(data_cmd, "%d/%m/%Y")
         except: dt = datetime.now()
 
-    dados_brutos = await extrair_jogos_flashscore(dt)
-    if not dados_brutos:
-        raise HTTPException(status_code=404, detail="Nenhum dado encontrado no Flashscore.")
-
-    jogos = extrair_todos_jogos_com_ia(dados_brutos)
-    if not jogos:
-        raise HTTPException(status_code=404, detail="Nenhum jogo estruturado pôde ser extraído.")
-
-    # 3. COMPUTAÇÃO TÉRMICA E EXCEL
-    heatmap = calcular_heatmap(jogos)
-    power_hours = calcular_power_hours(heatmap)
-    alertas = calcular_alertas(jogos, power_hours)
+    task_id = str(uuid.uuid4())
+    background_tasks.add_task(processar_varredura_background, task_id, dt, data_cmd)
     
-    arquivo_excel = gerar_excel(jogos, heatmap, power_hours, alertas, dt)
-    
-    # 4. ENTREGA DO ARQUIVO PARA A VERCEL EM BASE64
-    with open(arquivo_excel, "rb") as f:
-        bytes_planilha = f.read()
-    planilha_base64 = base64.b64encode(bytes_planilha).decode('utf-8')
-    os.remove(arquivo_excel) # Mantém a nuvem limpa
-    
-    print("✅ Extração concluída com sucesso! Devolvendo JSON para a Vercel.")
     return {
-        "status": "sucesso",
-        "dados_painel": {"total_jogos": len(jogos)},
-        "planilha_nome": arquivo_excel,
-        "planilha_base64": planilha_base64
+        "status": "iniciado",
+        "task_id": task_id,
+        "mensagem": "Varredura iniciada em nuvem. Acompanhe o status."
     }
+
+@app.get("/status_varredura")
+async def endpoint_status(task_id: str = Query(...)):
+    tarefa = tarefas_varredura.get(task_id)
+    if not tarefa:
+        raise HTTPException(status_code=404, detail="Tarefa não encontrada ou expirada.")
+    return tarefa
 
 if __name__ == "__main__":
     # Inicia o servidor Web Uvicorn (usado pela Render)
