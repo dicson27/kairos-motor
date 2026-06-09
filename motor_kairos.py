@@ -9,6 +9,10 @@ from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+# MÁGICA DA NUVEM: Ensina o Python a achar o navegador baixado pelo build.sh na Render
+if os.environ.get("RENDER"):
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+
 import pandas as pd
 from playwright.async_api import async_playwright
 from openpyxl import load_workbook
@@ -90,10 +94,10 @@ URLS_ESPORTES = {
 o_loop = None # Guardará o loop do asyncio
 
 # =============================================
-# SCRAPING ROBUSTO
+# SCRAPING ROBUSTO E OTIMIZADO PARA NUVEM
 # =============================================
 async def rolar_pagina_completa(page):
-    print("   📜 Rolando página completa...")
+    print("   📜 Rolando página completa de forma acelerada...")
     altura_anterior = 0
     tentativas_sem_mudanca = 0
     while tentativas_sem_mudanca < 3:
@@ -102,9 +106,9 @@ async def rolar_pagina_completa(page):
         else: tentativas_sem_mudanca = 0
         altura_anterior = altura_atual
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(300) # Reduzido de 1500 para 300ms
     await page.evaluate("window.scrollTo(0, 0)")
-    await page.wait_for_timeout(1000)
+    await page.wait_for_timeout(200)
 
 async def navegar_para_data(page, data_alvo: datetime):
     hoje = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -115,8 +119,8 @@ async def navegar_para_data(page, data_alvo: datetime):
     seta = "button[data-day-picker-arrow='next']" if diff_dias > 0 else "button[data-day-picker-arrow='prev']"
     for i in range(abs(diff_dias)):
         try:
-            await page.click(seta, timeout=5000)
-            await page.wait_for_timeout(1000)
+            await page.click(seta, timeout=3000)
+            await page.wait_for_timeout(500)
         except Exception as e:
             break
 
@@ -124,36 +128,36 @@ async def extrair_texto_esporte(page, esporte, url_base, data: datetime):
     print(f"   🌐 Acessando {esporte} → {url_base}")
     try:
         await page.goto(url_base, wait_until="domcontentloaded", timeout=60000)
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(1000) # Reduzido de 5000 para 1000ms
         try:
-            await page.click("button#onetrust-accept-btn-handler", timeout=3000)
-            await page.wait_for_timeout(1000)
+            await page.click("button#onetrust-accept-btn-handler", timeout=2000)
+            await page.wait_for_timeout(500)
         except: pass
         
         await navegar_para_data(page, data)
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(1000)
         
         hoje = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
         alvo = data.replace(hour=0, minute=0, second=0, microsecond=0)
         if alvo > hoje:
             for seletor_aba in ["button:has-text('PRÓXIMOS')", "text=PRÓXIMOS", "button:has-text('TODOS')", "text=TODOS"]:
                 try:
-                    await page.click(seletor_aba, timeout=3000)
-                    await page.wait_for_timeout(2000)
+                    await page.click(seletor_aba, timeout=2000)
+                    await page.wait_for_timeout(1000)
                     break
                 except: continue
         elif alvo < hoje:
             for seletor_aba in ["button:has-text('ENCERRADOS')", "text=ENCERRADOS"]:
                 try:
-                    await page.click(seletor_aba, timeout=3000)
-                    await page.wait_for_timeout(2000)
+                    await page.click(seletor_aba, timeout=2000)
+                    await page.wait_for_timeout(1000)
                     break
                 except: continue
         else:
             for seletor_aba in ["button:has-text('TODOS')", "text=TODOS"]:
                 try:
-                    await page.click(seletor_aba, timeout=3000)
-                    await page.wait_for_timeout(2000)
+                    await page.click(seletor_aba, timeout=2000)
+                    await page.wait_for_timeout(1000)
                     break
                 except: continue
                 
@@ -165,13 +169,23 @@ async def extrair_texto_esporte(page, esporte, url_base, data: datetime):
         print(f"   ⚠️ Erro em {esporte}: {e}")
         return ""
 
+# Função interceptadora para bloquear peso inútil
+async def interceptar_rota(route):
+    if route.request.resource_type in ["image", "stylesheet", "media", "font", "other"]:
+        await route.abort()
+    else:
+        await route.continue_()
+
 async def extrair_jogos_flashscore(data: datetime = None):
     if data is None: data = datetime.now()
     dados_por_esporte = {}
     async with async_playwright() as p:
-        # MODO NUVEM: headless=True (Obrigatório em servidores Linux sem monitor)
         browser = await p.chromium.launch(headless=True, args=["--start-maximized"])
         context = await browser.new_context(viewport={"width": 1366, "height": 768}, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+        
+        # OTIMIZAÇÃO EXTREMA: Bloqueia carregamento de imagens, vídeos, fontes e estilos CSS
+        await context.route("**/*", interceptar_rota)
+        
         page = await context.new_page()
         for esporte, url in URLS_ESPORTES.items():
             texto = await extrair_texto_esporte(page, esporte, url, data)
