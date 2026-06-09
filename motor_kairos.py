@@ -179,19 +179,22 @@ async def interceptar_rota(route):
 async def extrair_jogos_flashscore(data: datetime = None):
     if data is None: data = datetime.now()
     dados_por_esporte = {}
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--start-maximized"])
-        context = await browser.new_context(viewport={"width": 1366, "height": 768}, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-        
-        # OTIMIZAÇÃO EXTREMA: Bloqueia carregamento de imagens, vídeos, fontes e estilos CSS
-        await context.route("**/*", interceptar_rota)
-        
-        for esporte, url in URLS_ESPORTES.items():
+    
+    for esporte, url in URLS_ESPORTES.items():
+        async with async_playwright() as p:
+            # --disable-dev-shm-usage é OBRIGATÓRIO no Docker/Render para não estourar a memória compartilhada
+            browser = await p.chromium.launch(headless=True, args=["--start-maximized", "--disable-dev-shm-usage", "--no-sandbox"])
+            context = await browser.new_context(viewport={"width": 1366, "height": 768}, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            
+            # OTIMIZAÇÃO EXTREMA: Bloqueia carregamento de imagens, vídeos, fontes e estilos CSS
+            await context.route("**/*", interceptar_rota)
+            
             page = await context.new_page()
             texto = await extrair_texto_esporte(page, esporte, url, data)
             if texto: dados_por_esporte[esporte] = texto
-            await page.close() # Libera a RAM do Linux fechando a aba
-        await browser.close()
+            
+            await browser.close() # Mata o navegador inteiramente após cada esporte, esvaziando a RAM a zero
+            
     return dados_por_esporte
 
 # =============================================
