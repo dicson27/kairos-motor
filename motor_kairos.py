@@ -9,6 +9,12 @@ from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+# =============================================
+# CORREÇÃO PARA WINDOWS (PLAYWRIGHT SUBPROCESS)
+# =============================================
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 # MÁGICA DA NUVEM: Ensina o Python a achar o navegador baixado pelo build.sh na Render
 if os.environ.get("RENDER"):
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
@@ -180,20 +186,26 @@ async def extrair_jogos_flashscore(data: datetime = None):
     if data is None: data = datetime.now()
     dados_por_esporte = {}
     
+    # Determina se está rodando no modo invisível (pythonw) ou depuração (python)
+    # No Google Cloud Run (K_SERVICE existe), FORÇAMOS o modo invisível para evitar crash!
+    is_debug = ("pythonw" not in sys.executable.lower()) and not os.environ.get("K_SERVICE")
+    
     for esporte, url in URLS_ESPORTES.items():
         async with async_playwright() as p:
-            # --disable-dev-shm-usage é OBRIGATÓRIO no Docker/Render para não estourar a memória compartilhada
-            browser = await p.chromium.launch(headless=True, args=["--start-maximized", "--disable-dev-shm-usage", "--no-sandbox"])
-            context = await browser.new_context(viewport={"width": 1366, "height": 768}, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            # headless=False faz o navegador aparecer na tela apenas no modo depuração!
+            browser = await p.chromium.launch(headless=not is_debug, args=["--start-maximized"])
             
-            # OTIMIZAÇÃO EXTREMA: Bloqueia carregamento de imagens, vídeos, fontes e estilos CSS
-            await context.route("**/*", interceptar_rota)
+            # no_viewport=True para preencher a tela inteira com o navegador maximizado
+            context = await browser.new_context(no_viewport=True, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+            
+            # (Opcional) Desativado para você ver o site original com as cores e imagens!
+            # await context.route("**/*", interceptar_rota)
             
             page = await context.new_page()
             texto = await extrair_texto_esporte(page, esporte, url, data)
             if texto: dados_por_esporte[esporte] = texto
             
-            await browser.close() # Mata o navegador inteiramente após cada esporte, esvaziando a RAM a zero
+            await browser.close() # Fecha a aba e abre a próxima no próximo ciclo
             
     return dados_por_esporte
 
@@ -406,43 +418,8 @@ app.add_middleware(
 def health_check():
     return {"status": "online", "mensagem": "Motor Kairós operando na Nuvem ☁️"}
 
-async def processar_varredura_background(task_id: str, dt: datetime, data_cmd: str):
-    try:
-        tarefas_varredura[task_id] = {"status": "processando", "mensagem": "Raspando os esportes..."}
-        dados_brutos = await extrair_jogos_flashscore(dt)
-        if not dados_brutos:
-            tarefas_varredura[task_id] = {"status": "erro", "mensagem": "Nenhum dado encontrado no Flashscore."}
-            return
-
-        jogos = extrair_todos_jogos_com_ia(dados_brutos)
-        if not jogos:
-            tarefas_varredura[task_id] = {"status": "erro", "mensagem": "Nenhum jogo estruturado extraído."}
-            return
-
-        heatmap = calcular_heatmap(jogos)
-        power_hours = calcular_power_hours(heatmap)
-        alertas = calcular_alertas(jogos, power_hours)
-        
-        arquivo_excel = gerar_excel(jogos, heatmap, power_hours, alertas, dt)
-        
-        with open(arquivo_excel, "rb") as f:
-            bytes_planilha = f.read()
-        planilha_base64 = base64.b64encode(bytes_planilha).decode('utf-8')
-        os.remove(arquivo_excel)
-        
-        tarefas_varredura[task_id] = {
-            "status": "concluido",
-            "dados_painel": {"total_jogos": len(jogos)},
-            "planilha_nome": arquivo_excel,
-            "planilha_base64": planilha_base64
-        }
-        print(f"✅ Tarefa {task_id} concluída com sucesso!")
-    except Exception as e:
-        print(f"❌ Erro na tarefa {task_id}: {e}")
-        tarefas_varredura[task_id] = {"status": "erro", "mensagem": str(e)}
-
 @app.get("/analisar")
-async def endpoint_analisar(background_tasks: BackgroundTasks, data: str = Query("hoje"), token: str = Query("")):
+async def endpoint_analisar(data: str = Query("hoje"), token: str = Query("")):
     print(f"📡 Requisição recebida. Data: {data}")
     
     if not verificar_token_seguranca(token):
@@ -456,24 +433,35 @@ async def endpoint_analisar(background_tasks: BackgroundTasks, data: str = Query
         try: dt = datetime.strptime(data_cmd, "%d/%m/%Y")
         except: dt = datetime.now()
 
-    task_id = str(uuid.uuid4())
-    background_tasks.add_task(processar_varredura_background, task_id, dt, data_cmd)
+    print("Iniciando raspagem direta no PC...")
+    dados_brutos = await extrair_jogos_flashscore(dt)
+    if not dados_brutos:
+        raise HTTPException(status_code=404, detail="Nenhum dado encontrado no Flashscore.")
+
+    jogos = extrair_todos_jogos_com_ia(dados_brutos)
+    if not jogos:
+        raise HTTPException(status_code=404, detail="Nenhum jogo estruturado pôde ser extraído.")
+
+    heatmap = calcular_heatmap(jogos)
+    power_hours = calcular_power_hours(heatmap)
+    alertas = calcular_alertas(jogos, power_hours)
     
+    arquivo_excel = gerar_excel(jogos, heatmap, power_hours, alertas, dt)
+    
+    with open(arquivo_excel, "rb") as f:
+        bytes_planilha = f.read()
+    planilha_base64 = base64.b64encode(bytes_planilha).decode('utf-8')
+    os.remove(arquivo_excel) 
+    
+    print("✅ Extração concluída com sucesso! Devolvendo JSON para o Painel.")
     return {
-        "status": "iniciado",
-        "task_id": task_id,
-        "mensagem": "Varredura iniciada em nuvem. Acompanhe o status."
+        "status": "sucesso",
+        "dados_painel": {"total_jogos": len(jogos)},
+        "planilha_nome": arquivo_excel,
+        "planilha_base64": planilha_base64
     }
 
-@app.get("/status_varredura")
-async def endpoint_status(task_id: str = Query(...)):
-    tarefa = tarefas_varredura.get(task_id)
-    if not tarefa:
-        raise HTTPException(status_code=404, detail="Tarefa não encontrada ou expirada.")
-    return tarefa
-
 if __name__ == "__main__":
-    # Inicia o servidor Web Uvicorn (usado pela Render)
-    port = int(os.environ.get("PORT", 8000))
-    print(f"🚀 Iniciando servidor FastAPI Kairós na porta {port}...")
+    port = int(os.environ.get("PORT", 4875))
+    print(f"🚀 Iniciando servidor Motor Kairós Local na porta {port}...")
     uvicorn.run("motor_kairos:app", host="0.0.0.0", port=port)
