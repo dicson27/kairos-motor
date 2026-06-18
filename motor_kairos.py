@@ -420,46 +420,55 @@ def health_check():
 
 @app.get("/analisar")
 async def endpoint_analisar(data: str = Query("hoje"), token: str = Query("")):
-    print(f"📡 Requisição recebida. Data: {data}")
-    
-    if not verificar_token_seguranca(token):
-        print("❌ Bloqueio: Licença inválida.")
-        raise HTTPException(status_code=401, detail="Assinatura Kairós inativa ou inválida. Renove seu acesso.")
-    
-    data_cmd = data.lower().strip()
-    if data_cmd == "hoje": dt = datetime.now()
-    elif data_cmd in ["amanha", "amanhã"]: dt = datetime.now() + timedelta(days=1)
-    else:
-        try: dt = datetime.strptime(data_cmd, "%d/%m/%Y")
-        except: dt = datetime.now()
+    try:
+        print(f"📡 Requisição recebida. Data: {data}")
+        
+        if not verificar_token_seguranca(token):
+            print("❌ Bloqueio: Licença inválida.")
+            raise HTTPException(status_code=401, detail="Assinatura Kairós inativa ou inválida. Renove seu acesso.")
+        
+        data_cmd = data.lower().strip()
+        if data_cmd == "hoje": dt = datetime.now()
+        elif data_cmd in ["amanha", "amanhã"]: dt = datetime.now() + timedelta(days=1)
+        else:
+            try: dt = datetime.strptime(data_cmd, "%d/%m/%Y")
+            except: dt = datetime.now()
 
-    print("Iniciando raspagem direta no PC...")
-    dados_brutos = await extrair_jogos_flashscore(dt)
-    if not dados_brutos:
-        raise HTTPException(status_code=404, detail="Nenhum dado encontrado no Flashscore.")
+        print("Iniciando raspagem direta no PC...")
+        dados_brutos = await extrair_jogos_flashscore(dt)
+        if not dados_brutos:
+            raise HTTPException(status_code=404, detail="Nenhum dado encontrado no Flashscore.")
 
-    jogos = extrair_todos_jogos_com_ia(dados_brutos)
-    if not jogos:
-        raise HTTPException(status_code=404, detail="Nenhum jogo estruturado pôde ser extraído.")
+        jogos = extrair_todos_jogos_com_ia(dados_brutos)
+        if not jogos:
+            raise HTTPException(status_code=404, detail="Nenhum jogo estruturado pôde ser extraído.")
 
-    heatmap = calcular_heatmap(jogos)
-    power_hours = calcular_power_hours(heatmap)
-    alertas = calcular_alertas(jogos, power_hours)
-    
-    arquivo_excel = gerar_excel(jogos, heatmap, power_hours, alertas, dt)
-    
-    with open(arquivo_excel, "rb") as f:
-        bytes_planilha = f.read()
-    planilha_base64 = base64.b64encode(bytes_planilha).decode('utf-8')
-    os.remove(arquivo_excel) 
-    
-    print("✅ Extração concluída com sucesso! Devolvendo JSON para o Painel.")
-    return {
-        "status": "sucesso",
-        "dados_painel": {"total_jogos": len(jogos)},
-        "planilha_nome": arquivo_excel,
-        "planilha_base64": planilha_base64
-    }
+        heatmap = calcular_heatmap(jogos)
+        power_hours = calcular_power_hours(heatmap)
+        alertas = calcular_alertas(jogos, power_hours)
+        
+        arquivo_excel = gerar_excel(jogos, heatmap, power_hours, alertas, dt)
+        
+        with open(arquivo_excel, "rb") as f:
+            bytes_planilha = f.read()
+        planilha_base64 = base64.b64encode(bytes_planilha).decode('utf-8')
+        os.remove(arquivo_excel) 
+        
+        print("✅ Extração concluída com sucesso! Devolvendo JSON para o Painel.")
+        return {
+            "status": "sucesso",
+            "dados_painel": {"total_jogos": len(jogos)},
+            "planilha_nome": arquivo_excel,
+            "planilha_base64": planilha_base64
+        }
+    except HTTPException as http_exc:
+        raise http_exc
+    except Exception as e:
+        import traceback
+        erro_completo = traceback.format_exc()
+        print(f"ERRO FATAL NA NUVEM:\n{erro_completo}")
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=500, content={"detail": f"Erro interno: {str(e)}", "traceback": erro_completo})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 4875))
